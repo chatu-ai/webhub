@@ -56,6 +56,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@chatu-ai/webhub": "^0.1.3",
     "@sinclair/typebox": "^0.32.0",
     "@types/uuid": "^10.0.0",
     "uuid": "^13.0.0",
@@ -67,7 +68,7 @@
     "@types/node": "^20.0.0",
     "@types/ws": "^8.5.0",
     "jest": "^30.2.0",
-    "openclaw": "2026.2.19-2",
+    "openclaw": "^2026.4.22",
     "ts-jest": "^29.4.6",
     "typescript": "^5.3.0"
   }

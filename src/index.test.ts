@@ -272,7 +272,18 @@ describe('WS connection lifecycle (T037)', () => {
 
 // ─── T042: Streaming relay (relayStreamChunk / relayStreamDone) ────────────
 
-import { relayStreamChunk, relayStreamDone } from './index';
+import {
+  createChatuStreamRelay,
+  formatChatuCommandOutputPayload,
+  formatChatuPatchSummaryPayload,
+  formatChatuToolApprovalPayload,
+  formatChatuToolItemPayload,
+  formatChatuToolPlanPayload,
+  formatChatuToolResultPayload,
+  formatChatuToolStartPayload,
+  relayStreamChunk,
+  relayStreamDone,
+} from './index';
 
 describe('Streaming relay (T042)', () => {
   const API_URL = 'http://localhost:3000';
@@ -428,5 +439,229 @@ describe('Streaming relay (T042)', () => {
       expect(urls[2]).toContain('/stream/chunk');
       expect(urls[3]).toContain('/stream/done');
     });
+  });
+});
+
+// ─── Chatu stream relay sequencing/recovery ────────────────────────────────
+
+describe('createChatuStreamRelay', () => {
+  it('flushes the pending text chunk before sending done', async () => {
+    const calls: any[] = [];
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-1',
+      accountId: 'default',
+      deliverStreamChunk: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+      deliverStreamDone: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+    });
+
+    relay.updateText('Hello');
+    await relay.finalize();
+
+    expect(calls).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, delta: 'Hello', type: 'text' }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 1 }),
+    ]);
+  });
+
+  it('serializes pending text before direct tool chunks', async () => {
+    const calls: any[] = [];
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-2',
+      accountId: 'default',
+      deliverStreamChunk: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+      deliverStreamDone: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+    });
+
+    relay.updateText('Working');
+    await relay.sendChunkDirect('tool-a', 'tool_start');
+    await relay.finalize();
+
+    expect(calls).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, delta: 'Working', type: 'text' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 1, delta: 'tool-a', type: 'tool_start' }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 2 }),
+    ]);
+  });
+
+  it('flushes pending text before resetting for a new assistant message', async () => {
+    const calls: any[] = [];
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-reset',
+      accountId: 'default',
+      deliverStreamChunk: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+      deliverStreamDone: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+    });
+
+    relay.updateText('before tool');
+    await relay.resetForNewMessage();
+    relay.updateText('after tool');
+    await relay.finalize();
+
+    expect(calls).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, delta: 'before tool', type: 'text' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 1, delta: 'after tool', type: 'text' }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 2 }),
+    ]);
+  });
+
+  it('caches failed stream frames and preserves done for reconnect replay', async () => {
+    const cached: any[] = [];
+    const deliverStreamDone = jest.fn(async () => ({ ok: true }));
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-3',
+      accountId: 'default',
+      deliverStreamChunk: async () => ({ ok: false, error: 'offline' }),
+      deliverStreamDone,
+      cacheFrame: (frame) => cached.push(frame),
+    });
+
+    relay.updateText('Recover me');
+    await relay.finalize();
+
+    expect(deliverStreamDone).not.toHaveBeenCalled();
+    expect(cached).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, delta: 'Recover me', type: 'text' }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 1 }),
+    ]);
+  });
+
+  it('streams full tool lifecycle with chunked tool results before done', async () => {
+    const calls: any[] = [];
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-tool',
+      accountId: 'default',
+      chunkLimit: 5,
+      deliverStreamChunk: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+      deliverStreamDone: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+    });
+
+    await relay.sendChunkDirect(formatChatuToolStartPayload({ name: 'read', phase: 'start' }), 'tool_start');
+    await relay.sendChunkedDirect('abcdefghijk', 'tool_result');
+    await relay.finalize();
+
+    expect(calls).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, delta: 'read start', type: 'tool_start' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 1, delta: 'abcde', type: 'tool_result' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 2, delta: 'fghij', type: 'tool_result' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 3, delta: 'k', type: 'tool_result' }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 4 }),
+    ]);
+  });
+
+  it('streams detailed OpenClaw tool events with distinct chunk types', async () => {
+    const calls: any[] = [];
+    const relay = createChatuStreamRelay({
+      messageId: 'stream-tool-events',
+      accountId: 'default',
+      chunkLimit: 6,
+      deliverStreamChunk: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+      deliverStreamDone: async (frame) => {
+        calls.push(frame);
+        return { ok: true };
+      },
+    });
+
+    await relay.sendChunkDirect(formatChatuToolItemPayload({ phase: 'start', title: 'read file', itemId: 'item-1' }), 'tool_item');
+    await relay.sendChunkDirect(formatChatuToolPlanPayload({ phase: 'update', title: 'Plan', steps: ['Inspect', 'Patch'] }), 'tool_plan');
+    await relay.sendChunkDirect(formatChatuToolApprovalPayload({ phase: 'requested', status: 'pending', title: 'Run command' }), 'tool_approval');
+    await relay.sendChunkedDirect(formatChatuCommandOutputPayload({ phase: 'delta', title: 'command ls', output: 'abcdefghijkl' }), 'tool_command_output');
+    await relay.sendChunkDirect(formatChatuPatchSummaryPayload({ phase: 'end', title: 'apply patch', modified: ['src/index.ts'] }), 'tool_patch_summary');
+    await relay.finalize();
+
+    expect(calls).toEqual([
+      expect.objectContaining({ kind: 'stream_chunk', seq: 0, type: 'tool_item', delta: expect.stringContaining('start: read file') }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 1, type: 'tool_plan', delta: expect.stringContaining('1. Inspect') }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 2, type: 'tool_approval', delta: expect.stringContaining('requested pending: Run command') }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 3, type: 'tool_command_output', delta: 'abcdef' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 4, type: 'tool_command_output', delta: 'ghijkl' }),
+      expect.objectContaining({ kind: 'stream_chunk', seq: 5, type: 'tool_patch_summary', delta: expect.stringContaining('modified: src/index.ts') }),
+      expect.objectContaining({ kind: 'stream_done', totalSeq: 6 }),
+    ]);
+  });
+});
+
+describe('tool stream payload formatters', () => {
+  it('formats tool start with name and phase', () => {
+    expect(formatChatuToolStartPayload({ name: 'browser', phase: 'start' })).toBe('browser start');
+  });
+
+  it('formats tool result text, media, and channel data', () => {
+    const formatted = formatChatuToolResultPayload({
+      text: 'done',
+      mediaUrls: ['https://example.test/a.png'],
+      channelData: { ok: true },
+    });
+
+    expect(formatted).toContain('done');
+    expect(formatted).toContain('media: https://example.test/a.png');
+    expect(formatted).toContain('channelData: {"ok":true}');
+  });
+
+  it('formats detailed OpenClaw tool event payloads', () => {
+    expect(formatChatuToolItemPayload({
+      phase: 'update',
+      title: 'Reading package.json',
+      progressText: '50%',
+      itemId: 'item-1',
+    })).toContain('progress: 50%');
+
+    expect(formatChatuToolPlanPayload({
+      phase: 'update',
+      title: 'Plan',
+      explanation: 'Do the work',
+      steps: ['Read', 'Patch'],
+    })).toContain('2. Patch');
+
+    expect(formatChatuToolApprovalPayload({
+      phase: 'requested',
+      status: 'pending',
+      title: 'Command approval',
+      command: 'npm test',
+    })).toContain('command: npm test');
+
+    expect(formatChatuCommandOutputPayload({ phase: 'delta', title: 'command ls', output: 'stdout chunk' })).toBe('stdout chunk');
+    expect(formatChatuCommandOutputPayload({
+      phase: 'end',
+      title: 'npm test',
+      status: 'success',
+      exitCode: 0,
+      durationMs: 123,
+      output: 'passed',
+    })).toContain('exitCode: 0');
+
+    expect(formatChatuPatchSummaryPayload({
+      phase: 'end',
+      title: 'apply patch',
+      added: ['a.ts'],
+      modified: ['b.ts'],
+      deleted: ['c.ts'],
+    })).toContain('deleted: c.ts');
   });
 });

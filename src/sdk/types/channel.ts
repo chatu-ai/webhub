@@ -302,6 +302,17 @@ export type MessageContentType = 'text' | 'image' | 'file' | 'action' | 'unknown
 /**
  * T005: Payload for a single streaming chunk, sent to API via POST /api/channel/stream/chunk.
  */
+export type StreamChunkType =
+  | 'text'
+  | 'reasoning'
+  | 'tool_start'
+  | 'tool_result'
+  | 'tool_item'
+  | 'tool_plan'
+  | 'tool_approval'
+  | 'tool_command_output'
+  | 'tool_patch_summary';
+
 export interface StreamChunkPayload {
   /** Unique message ID (UUID v4) */
   messageId: string;
@@ -309,6 +320,8 @@ export interface StreamChunkPayload {
   seq: number;
   /** Incremental text delta from this chunk */
   delta: string;
+  /** Content type of this chunk */
+  type?: StreamChunkType;
 }
 
 /**

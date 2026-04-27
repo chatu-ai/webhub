@@ -41,6 +41,8 @@ export interface ChatuAccount {
   secret?: string;
   accessToken?: string;
   timeout: number;
+  streaming?: boolean;
+  streamThrottleMs?: number;
 }
 
 /** Custom setup input fields used by the Chatu channel. */
@@ -55,6 +57,337 @@ const POLL_INTERVAL_MS = 2000;
 const MAX_BACKOFF_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_CHUNK_LIMIT = 4000;
+const DEFAULT_STREAM_THROTTLE_MS = 0;
+
+type ChatuStreamChunkType =
+  | 'text'
+  | 'reasoning'
+  | 'tool_start'
+  | 'tool_result'
+  | 'tool_item'
+  | 'tool_plan'
+  | 'tool_approval'
+  | 'tool_command_output'
+  | 'tool_patch_summary';
+type ChatuToolStreamChunkType = Exclude<ChatuStreamChunkType, 'text' | 'reasoning'>;
+
+type ChatuStreamFrame =
+  | {
+      kind: 'stream_chunk';
+      messageId: string;
+      seq: number;
+      delta: string;
+      type?: ChatuStreamChunkType;
+      accountId?: string | null;
+    }
+  | {
+      kind: 'stream_done';
+      messageId: string;
+      totalSeq: number;
+      accountId?: string | null;
+    };
+
+type StreamRelayResult = { ok: boolean; error?: string };
+
+export function createChatuStreamRelay(params: {
+  messageId: string;
+  accountId: string;
+  throttleMs?: number;
+  chunkLimit?: number;
+  deliverStreamChunk: (frame: Extract<ChatuStreamFrame, { kind: 'stream_chunk' }>) => Promise<StreamRelayResult>;
+  deliverStreamDone: (frame: Extract<ChatuStreamFrame, { kind: 'stream_done' }>) => Promise<StreamRelayResult>;
+  cacheFrame?: (frame: ChatuStreamFrame, reason?: string) => void;
+}) {
+  const { messageId, accountId } = params;
+  const throttleMs = params.throttleMs ?? DEFAULT_STREAM_THROTTLE_MS;
+  const chunkLimit = Math.max(1, params.chunkLimit ?? DEFAULT_CHUNK_LIMIT);
+  let seq = 0;
+  let stopped = false;
+  let degraded = false;
+  let sendQueue: Promise<void> = Promise.resolve();
+  let textFramesEmitted = 0;
+  let successfulTextFrames = 0;
+
+  const cacheFrame = (frame: ChatuStreamFrame, reason?: string) => {
+    degraded = true;
+    params.cacheFrame?.(frame, reason);
+  };
+
+  const enqueueFrame = (frame: ChatuStreamFrame): Promise<void> => {
+    sendQueue = sendQueue.then(async () => {
+      if (degraded) {
+        cacheFrame(frame, 'stream relay degraded');
+        return;
+      }
+      const result = frame.kind === 'stream_chunk'
+        ? await params.deliverStreamChunk(frame)
+        : await params.deliverStreamDone(frame);
+      if (!result.ok) {
+        cacheFrame(frame, result.error);
+        return;
+      }
+      if (frame.kind === 'stream_chunk' && frame.type === 'text') {
+        successfulTextFrames++;
+      }
+    }).catch((err) => {
+      cacheFrame(frame, err instanceof Error ? err.message : String(err));
+    });
+    return sendQueue;
+  };
+
+  const makeThrottledSender = (
+    getLastSent: () => string,
+    setLastSent: (s: string) => void,
+    type: 'text' | 'reasoning',
+  ) => {
+    let pending = '';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inFlight: Promise<void> | undefined;
+
+    const flush = async () => {
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      if (inFlight) { await inFlight; }
+      if (!pending) return;
+      const text = pending;
+      pending = '';
+      const delta = text.slice(getLastSent().length);
+      if (!delta) return;
+      setLastSent(text);
+      const frame: Extract<ChatuStreamFrame, { kind: 'stream_chunk' }> = {
+        kind: 'stream_chunk',
+        messageId,
+        seq: seq++,
+        delta,
+        type,
+        accountId,
+      };
+      if (type === 'text') textFramesEmitted++;
+      inFlight = enqueueFrame(frame).finally(() => { inFlight = undefined; });
+      await inFlight;
+    };
+
+    return {
+      update: (text: string) => {
+        if (stopped) return;
+        pending = text;
+        if (throttleMs <= 0) {
+          void flush();
+          return;
+        }
+        if (!timer) timer = setTimeout(() => { void flush(); }, throttleMs);
+      },
+      flush,
+    };
+  };
+
+  let lastText = '';
+  let lastReasoning = '';
+  const textSender = makeThrottledSender(() => lastText, s => { lastText = s; }, 'text');
+  const reasoningSender = makeThrottledSender(() => lastReasoning, s => { lastReasoning = s; }, 'reasoning');
+
+  const flushPendingText = async () => {
+    await textSender.flush();
+    await reasoningSender.flush();
+  };
+
+  return {
+    updateText: (text: string) => textSender.update(text),
+    updateReasoning: (text: string) => reasoningSender.update(text),
+    sendChunkDirect: async (delta: string, type: ChatuToolStreamChunkType) => {
+      if (!delta || stopped) return;
+      await flushPendingText();
+      await enqueueFrame({ kind: 'stream_chunk', messageId, seq: seq++, delta, type, accountId });
+    },
+    sendChunkedDirect: async (delta: string, type: ChatuToolStreamChunkType) => {
+      if (!delta || stopped) return;
+      await flushPendingText();
+      for (let offset = 0; offset < delta.length; offset += chunkLimit) {
+        await enqueueFrame({
+          kind: 'stream_chunk',
+          messageId,
+          seq: seq++,
+          delta: delta.slice(offset, offset + chunkLimit),
+          type,
+          accountId,
+        });
+      }
+    },
+    resetForNewMessage: async () => {
+      await flushPendingText();
+      lastText = '';
+      lastReasoning = '';
+    },
+    finalize: async () => {
+      await flushPendingText();
+      await sendQueue;
+      await enqueueFrame({ kind: 'stream_done', messageId, totalSeq: seq, accountId });
+      await sendQueue;
+      stopped = true;
+    },
+    hasTextFrames: () => textFramesEmitted > 0,
+    hasSuccessfulTextFrames: () => successfulTextFrames > 0,
+    isDegraded: () => degraded,
+  };
+}
+
+function stringifyCompactJson(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+export function formatChatuToolStartPayload(payload: { name?: string; phase?: string } | undefined): string {
+  const name = typeof payload?.name === 'string' && payload.name.trim() ? payload.name.trim() : 'tool';
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : '';
+  return phase ? `${name} ${phase}` : name;
+}
+
+export function formatChatuToolResultPayload(payload: any): string {
+  const parts: string[] = [];
+  const text = typeof payload?.text === 'string' ? payload.text : '';
+  if (text) parts.push(text);
+
+  const mediaUrls = [
+    ...(typeof payload?.mediaUrl === 'string' && payload.mediaUrl ? [payload.mediaUrl] : []),
+    ...(Array.isArray(payload?.mediaUrls) ? payload.mediaUrls.filter((url: unknown): url is string => typeof url === 'string' && url.length > 0) : []),
+  ];
+  if (mediaUrls.length > 0) {
+    parts.push(`media: ${mediaUrls.join(', ')}`);
+  }
+
+  if (payload?.channelData && Object.keys(payload.channelData).length > 0) {
+    const channelData = stringifyCompactJson(payload.channelData);
+    if (channelData) parts.push(`channelData: ${channelData}`);
+  }
+
+  if (parts.length > 0) return parts.join('\n');
+  return stringifyCompactJson(payload) ?? '';
+}
+
+function pushLine(parts: string[], label: string, value: unknown): void {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed) parts.push(`${label}: ${trimmed}`);
+    return;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    parts.push(`${label}: ${String(value)}`);
+  }
+}
+
+function formatStringArray(label: string, values: unknown): string | undefined {
+  if (!Array.isArray(values)) return undefined;
+  const cleaned = values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  if (cleaned.length === 0) return undefined;
+  return `${label}: ${cleaned.join(', ')}`;
+}
+
+export function formatChatuToolItemPayload(payload: any): string {
+  const parts: string[] = [];
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : 'item';
+  const label =
+    (typeof payload?.title === 'string' && payload.title.trim()) ||
+    (typeof payload?.name === 'string' && payload.name.trim()) ||
+    (typeof payload?.kind === 'string' && payload.kind.trim()) ||
+    'tool item';
+  parts.push(`${phase}: ${label}`);
+  pushLine(parts, 'status', payload?.status);
+  pushLine(parts, 'summary', payload?.summary);
+  pushLine(parts, 'progress', payload?.progressText);
+  pushLine(parts, 'itemId', payload?.itemId);
+  pushLine(parts, 'approvalId', payload?.approvalId);
+  pushLine(parts, 'approvalSlug', payload?.approvalSlug);
+  return parts.join('\n');
+}
+
+export function formatChatuToolPlanPayload(payload: any): string {
+  const parts: string[] = [];
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : 'plan';
+  const title = typeof payload?.title === 'string' && payload.title.trim() ? payload.title.trim() : 'plan update';
+  parts.push(`${phase}: ${title}`);
+  pushLine(parts, 'explanation', payload?.explanation);
+  if (Array.isArray(payload?.steps)) {
+    const steps = payload.steps.filter((step: unknown): step is string => typeof step === 'string' && step.trim().length > 0);
+    if (steps.length > 0) parts.push(steps.map((step: string, index: number) => `${index + 1}. ${step}`).join('\n'));
+  }
+  pushLine(parts, 'source', payload?.source);
+  return parts.join('\n');
+}
+
+export function formatChatuToolApprovalPayload(payload: any): string {
+  const parts: string[] = [];
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : 'approval';
+  const status = typeof payload?.status === 'string' && payload.status.trim() ? ` ${payload.status.trim()}` : '';
+  const title = typeof payload?.title === 'string' && payload.title.trim() ? payload.title.trim() : 'approval event';
+  parts.push(`${phase}${status}: ${title}`);
+  pushLine(parts, 'kind', payload?.kind);
+  pushLine(parts, 'command', payload?.command);
+  pushLine(parts, 'host', payload?.host);
+  pushLine(parts, 'reason', payload?.reason);
+  pushLine(parts, 'scope', payload?.scope);
+  pushLine(parts, 'message', payload?.message);
+  pushLine(parts, 'itemId', payload?.itemId);
+  pushLine(parts, 'toolCallId', payload?.toolCallId);
+  pushLine(parts, 'approvalId', payload?.approvalId);
+  pushLine(parts, 'approvalSlug', payload?.approvalSlug);
+  return parts.join('\n');
+}
+
+export function formatChatuCommandOutputPayload(payload: any): string {
+  const output = typeof payload?.output === 'string' ? payload.output : '';
+  if (output.length > 0 && payload?.phase === 'delta') return output;
+  const hasOnlyOutput =
+    output.length > 0 &&
+    !payload?.status &&
+    payload?.exitCode === undefined &&
+    payload?.durationMs === undefined &&
+    !payload?.cwd &&
+    !payload?.title &&
+    !payload?.name;
+  if (hasOnlyOutput) return output;
+
+  const parts: string[] = [];
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : 'command';
+  const title =
+    (typeof payload?.title === 'string' && payload.title.trim()) ||
+    (typeof payload?.name === 'string' && payload.name.trim()) ||
+    'command output';
+  parts.push(`${phase}: ${title}`);
+  pushLine(parts, 'status', payload?.status);
+  if (payload?.exitCode === null) {
+    parts.push('exitCode: null');
+  } else {
+    pushLine(parts, 'exitCode', payload?.exitCode);
+  }
+  pushLine(parts, 'durationMs', payload?.durationMs);
+  pushLine(parts, 'cwd', payload?.cwd);
+  pushLine(parts, 'itemId', payload?.itemId);
+  pushLine(parts, 'toolCallId', payload?.toolCallId);
+  if (output) parts.push(output);
+  return parts.join('\n');
+}
+
+export function formatChatuPatchSummaryPayload(payload: any): string {
+  const parts: string[] = [];
+  const phase = typeof payload?.phase === 'string' && payload.phase.trim() ? payload.phase.trim() : 'patch';
+  const title =
+    (typeof payload?.title === 'string' && payload.title.trim()) ||
+    (typeof payload?.name === 'string' && payload.name.trim()) ||
+    'patch summary';
+  parts.push(`${phase}: ${title}`);
+  pushLine(parts, 'summary', payload?.summary);
+  const added = formatStringArray('added', payload?.added);
+  const modified = formatStringArray('modified', payload?.modified);
+  const deleted = formatStringArray('deleted', payload?.deleted);
+  if (added) parts.push(added);
+  if (modified) parts.push(modified);
+  if (deleted) parts.push(deleted);
+  pushLine(parts, 'itemId', payload?.itemId);
+  pushLine(parts, 'toolCallId', payload?.toolCallId);
+  return parts.join('\n');
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
@@ -109,6 +442,9 @@ export default function (api: OpenClawPluginApi) {
       secret:     acctCfg.secret     ?? channelCfg.secret     ?? pluginCfg.secret     ?? '',
       accessToken:acctCfg.accessToken?? channelCfg.accessToken?? pluginCfg.accessToken?? '',
       timeout:    acctCfg.timeout    ?? channelCfg.timeout    ?? pluginCfg.timeout    ?? DEFAULT_TIMEOUT_MS,
+      streaming:  acctCfg.streaming  ?? channelCfg.streaming  ?? pluginCfg.streaming  ?? false,
+      streamThrottleMs:
+        acctCfg.streamThrottleMs ?? channelCfg.streamThrottleMs ?? pluginCfg.streamThrottleMs ?? DEFAULT_STREAM_THROTTLE_MS,
     };
   }
 
@@ -307,6 +643,7 @@ export default function (api: OpenClawPluginApi) {
     messageId: string;
     seq: number;
     delta: string;
+    type?: ChatuStreamChunkType;
     accountId?: string | null;
   }): Promise<{ ok: boolean; error?: string }> {
     const cfg = getAccountConfig(params.accountId);
@@ -322,7 +659,7 @@ export default function (api: OpenClawPluginApi) {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${cfg.accessToken}`,
           },
-          body: JSON.stringify({ messageId: params.messageId, seq: params.seq, delta: params.delta }),
+          body: JSON.stringify({ messageId: params.messageId, seq: params.seq, delta: params.delta, type: params.type }),
         },
         cfg.timeout,
       );
@@ -453,6 +790,37 @@ export default function (api: OpenClawPluginApi) {
    * Dispatch a single user message from the web client to the OpenClaw AI
    * pipeline using the PluginRuntime API.
    */
+  function cacheStreamFrame(accountId: string, frame: ChatuStreamFrame, reason?: string): void {
+    const cfg = getAccountConfig(accountId);
+    const cache = getAccountCache(accountId);
+    const id = frame.kind === 'stream_chunk'
+      ? `stream:${frame.messageId}:${frame.seq}`
+      : `stream:${frame.messageId}:done`;
+    if (cache.snapshot().some((msg) => msg.id === id)) return;
+    cache.enqueue({
+      id,
+      channelId: cfg.channelId,
+      content: frame,
+      enqueuedAt: Date.now(),
+      status: 'pending',
+    });
+    api.logger.warn(
+      `[chatu] cached stream frame for retry (account=${accountId}, id=${id}${reason ? `, reason=${reason}` : ''})`,
+    );
+  }
+
+  function createChatuDraftStream(params: { messageId: string; accountId: string }) {
+    const cfg = getAccountConfig(params.accountId);
+    return createChatuStreamRelay({
+      messageId: params.messageId,
+      accountId: params.accountId,
+      throttleMs: cfg.streamThrottleMs,
+      deliverStreamChunk,
+      deliverStreamDone,
+      cacheFrame: (frame, reason) => cacheStreamFrame(params.accountId, frame, reason),
+    });
+  }
+
   async function dispatchUserMessage(params: {
     id: string;
     content: string;
@@ -510,45 +878,135 @@ export default function (api: OpenClawPluginApi) {
 
       api.logger.info(`[chatu] Dispatching user message to AI (id=${id}, sender=${senderId})`);
 
-      await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx: ctxPayload,
-        cfg,
-        dispatcherOptions: {
-          deliver: async (payload: any) => {
-            const text: string = payload.text ?? '';
-            if (!text) return;
-            // Retrieve the dedupId stored by before_message_write for this session.
-            const dedupId = pendingRelayIds.get(route.sessionKey as string);
-            if (dedupId) pendingRelayIds.delete(route.sessionKey as string);
-            const result = await deliverOutbound({
-              text,
-              target: senderId,
-              accountId,
-              replyTo: payload.replyToId ?? id,
-              metadata: dedupId ? { dedupId } : undefined,
-              raw: payload,
-            });
-            if (!result.ok) {
-              api.logger.error(`[chatu] Failed to deliver AI reply (target=${senderId}): ${result.error}`);
-              // T015 Plugin-Channel Realtime: cache failed delivery for retry on reconnect
-              const cfg2 = getAccountConfig(accountId);
-              const cache = getAccountCache(accountId);
-              const cacheId = result.messageId ?? `retry_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-              cache.enqueue({
-                id: cacheId,
-                channelId: cfg2.channelId,
-                content: { text, target: senderId, replyTo: payload.replyToId ?? id },
-                enqueuedAt: Date.now(),
-                status: 'pending',
-              });
-            }
-          },
-          onError: (err: unknown, info: { kind: string }) => {
-            api.logger.error(`[chatu] ${info.kind} reply failed: ${String(err)}`);
-          },
+      const streamingEnabled = getAccountConfig(accountId).streaming;
+      const streamMessageId = streamingEnabled ? crypto.randomUUID() : undefined;
+      const draftStream = streamMessageId
+        ? createChatuDraftStream({ messageId: streamMessageId, accountId })
+        : null;
+      let streamingFinalPayload: any | undefined;
+      const streamingReplyOptions = draftStream ? {
+        disableBlockStreaming: true,
+        onPartialReply: (p: any) => {
+          draftStream.updateText(p.text ?? '');
         },
-        replyOptions: {},
-      });
+        onReasoningStream: (p: any) => {
+          draftStream.updateReasoning(p.text ?? '');
+        },
+        onAssistantMessageStart: () => {
+          return draftStream.resetForNewMessage();
+        },
+        onToolStart: (p: any) => {
+          const delta = formatChatuToolStartPayload(p);
+          return draftStream.sendChunkDirect(delta, 'tool_start');
+        },
+        onItemEvent: (p: any) => {
+          const delta = formatChatuToolItemPayload(p);
+          return draftStream.sendChunkDirect(delta, 'tool_item');
+        },
+        onPlanUpdate: (p: any) => {
+          const delta = formatChatuToolPlanPayload(p);
+          return draftStream.sendChunkDirect(delta, 'tool_plan');
+        },
+        onApprovalEvent: (p: any) => {
+          const delta = formatChatuToolApprovalPayload(p);
+          return draftStream.sendChunkDirect(delta, 'tool_approval');
+        },
+        onCommandOutput: (p: any) => {
+          const delta = formatChatuCommandOutputPayload(p);
+          return draftStream.sendChunkedDirect(delta, 'tool_command_output');
+        },
+        onPatchSummary: (p: any) => {
+          const delta = formatChatuPatchSummaryPayload(p);
+          return draftStream.sendChunkDirect(delta, 'tool_patch_summary');
+        },
+      } as any : {};
+
+      try {
+        await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: ctxPayload,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (payload: any, info?: { kind?: string }) => {
+              if (streamingEnabled) {
+                if (info?.kind === 'tool' && draftStream) {
+                  const toolResult = formatChatuToolResultPayload(payload);
+                  if (toolResult) {
+                    await draftStream.sendChunkedDirect(toolResult, 'tool_result');
+                  }
+                  return;
+                }
+                if (info?.kind === 'final' || !streamingFinalPayload) {
+                  streamingFinalPayload = payload;
+                }
+                return;
+              }
+              const text: string = payload.text ?? '';
+              if (!text) return;
+              // Retrieve the dedupId stored by before_message_write for this session.
+              const dedupId = pendingRelayIds.get(route.sessionKey as string);
+              if (dedupId) pendingRelayIds.delete(route.sessionKey as string);
+              const result = await deliverOutbound({
+                text,
+                target: senderId,
+                accountId,
+                replyTo: payload.replyToId ?? id,
+                metadata: dedupId ? { dedupId } : undefined,
+                raw: payload,
+              });
+              if (!result.ok) {
+                api.logger.error(`[chatu] Failed to deliver AI reply (target=${senderId}): ${result.error}`);
+                // T015 Plugin-Channel Realtime: cache failed delivery for retry on reconnect
+                const cfg2 = getAccountConfig(accountId);
+                const cache = getAccountCache(accountId);
+                const cacheId = result.messageId ?? `retry_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+                cache.enqueue({
+                  id: cacheId,
+                  channelId: cfg2.channelId,
+                  content: { text, target: senderId, replyTo: payload.replyToId ?? id },
+                  enqueuedAt: Date.now(),
+                  status: 'pending',
+                });
+              }
+            },
+            onError: (err: unknown, info: { kind: string }) => {
+              api.logger.error(`[chatu] ${info.kind} reply failed: ${String(err)}`);
+            },
+          },
+          replyOptions: streamingReplyOptions,
+        });
+      } finally {
+        if (draftStream) {
+          await draftStream.finalize();
+        }
+      }
+
+      if (draftStream && !draftStream.hasTextFrames()) {
+        const finalText: string = streamingFinalPayload?.text ?? '';
+        if (finalText) {
+          const dedupId = pendingRelayIds.get(route.sessionKey as string);
+          if (dedupId) pendingRelayIds.delete(route.sessionKey as string);
+          const result = await deliverOutbound({
+            text: finalText,
+            target: senderId,
+            accountId,
+            replyTo: streamingFinalPayload?.replyToId ?? id,
+            metadata: dedupId ? { dedupId } : undefined,
+            raw: streamingFinalPayload,
+          });
+          if (!result.ok) {
+            const cfg2 = getAccountConfig(accountId);
+            const cache = getAccountCache(accountId);
+            const cacheId = result.messageId ?? `retry_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+            cache.enqueue({
+              id: cacheId,
+              channelId: cfg2.channelId,
+              content: { text: finalText, target: senderId, replyTo: streamingFinalPayload?.replyToId ?? id },
+              enqueuedAt: Date.now(),
+              status: 'pending',
+            });
+          }
+        }
+      }
     } catch (err) {
       api.logger.error(`[chatu] Exception dispatching user message (id=${id}): ${String(err)}`);
     }
@@ -781,6 +1239,24 @@ export default function (api: OpenClawPluginApi) {
         `[chatu] Reconnected — flushing ${cache.pendingCount} cached messages (account=${ctx.accountId})`,
       );
       await cache.flush(async (cachedMsg) => {
+        const streamFrame = cachedMsg.content as Partial<ChatuStreamFrame>;
+        if (streamFrame.kind === 'stream_chunk') {
+          const result = await deliverStreamChunk(streamFrame as Extract<ChatuStreamFrame, { kind: 'stream_chunk' }>);
+          if (!result.ok) {
+            throw new Error(result.error ?? 'Cached stream chunk delivery failed');
+          }
+          cache.ack(cachedMsg.id);
+          return;
+        }
+        if (streamFrame.kind === 'stream_done') {
+          const result = await deliverStreamDone(streamFrame as Extract<ChatuStreamFrame, { kind: 'stream_done' }>);
+          if (!result.ok) {
+            throw new Error(result.error ?? 'Cached stream done delivery failed');
+          }
+          cache.ack(cachedMsg.id);
+          return;
+        }
+
         const payload = cachedMsg.content as { text: string; target: string; replyTo?: string };
         const result = await deliverOutbound({
           text: payload.text ?? '',
@@ -1001,6 +1477,11 @@ export default function (api: OpenClawPluginApi) {
           secret:      { type: 'string', description: 'Channel secret (wh_secret_...)' },
           accessToken: { type: 'string', description: 'Access token' },
           timeout:     { type: 'number', description: 'Request timeout in ms' },
+          streaming:   { type: 'boolean', description: 'Enable streaming mode (sends chunks via /api/channel/stream/chunk)' },
+          streamThrottleMs: {
+            type: 'number',
+            description: 'Streaming text/reasoning coalescing delay in ms. Set 0 to send one chunk per OpenClaw partial event.',
+          },
         },
       },
       uiHints: {
@@ -1026,6 +1507,13 @@ export default function (api: OpenClawPluginApi) {
           advanced: true,
         },
         timeout: { label: 'Timeout (ms)', placeholder: '30000', advanced: true },
+        streaming: { label: 'Streaming Mode', help: 'Stream AI responses chunk-by-chunk to the frontend', advanced: true },
+        streamThrottleMs: {
+          label: 'Stream Throttle (ms)',
+          placeholder: '0',
+          help: '0 sends a WebHub chunk for every OpenClaw partial text/reasoning event',
+          advanced: true,
+        },
       },
     },
 
@@ -1083,6 +1571,9 @@ export default function (api: OpenClawPluginApi) {
           secret:      acct.secret      ?? channelCfg.secret,
           accessToken: acct.accessToken ?? channelCfg.accessToken,
           timeout:     acct.timeout     ?? channelCfg.timeout     ?? DEFAULT_TIMEOUT_MS,
+          streaming:   acct.streaming   ?? channelCfg.streaming   ?? false,
+          streamThrottleMs:
+            acct.streamThrottleMs ?? channelCfg.streamThrottleMs ?? DEFAULT_STREAM_THROTTLE_MS,
         };
       },
 
@@ -1341,28 +1832,6 @@ export default function (api: OpenClawPluginApi) {
         return { channel: CHANNEL_ID, messageId: result.messageId ?? '' };
       },
 
-      // T042: streaming relay — forward AI stream chunks/done to WebHub API
-      // Cast to any: sendStreamChunk/sendStreamDone are chatu-specific extensions
-      // not yet in the openclaw plugin-sdk ChannelOutboundAdapter type.
-      ...(({
-        sendStreamChunk: async (ctx: any) => {
-          const { messageId, seq, delta, accountId } = ctx;
-          const result = await deliverStreamChunk({ messageId, seq, delta, accountId });
-          if (!result.ok) {
-            api.logger.warn(`[chatu] stream chunk relay failed (messageId=${messageId}): ${result.error}`);
-          }
-          return result;
-        },
-
-        sendStreamDone: async (ctx: any) => {
-          const { messageId, totalSeq, accountId } = ctx;
-          const result = await deliverStreamDone({ messageId, totalSeq, accountId });
-          if (!result.ok) {
-            api.logger.warn(`[chatu] stream done relay failed (messageId=${messageId}): ${result.error}`);
-          }
-          return result;
-        },
-      }) as any),
     },
   };
 
